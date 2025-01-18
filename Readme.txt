@@ -7,3 +7,5 @@
 7. Arduino.h
 8. ArduinoBLE.h
 9. nrf_temp.h
+10. Bleak
+11. Asyncio
