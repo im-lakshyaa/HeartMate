@@ -1,0 +1,799 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <MAX30105.h>
+#include <float.h>
+#include <Arduino.h>
+#include <ArduinoBLE.h>
+#include <nrf_temp.h>  // Library for accessing the internal temperature sensor
+
+// OLED and Sensor Setup
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+MAX30105 particleSensor;
+#define BAT_HIGH_CHARGE 22         // Adjust to appropriate pin if needed
+#define BAT_CHARGE_STATE 23        // Pin to check charge status
+#define VBAT_ENABLE -1             // Set to -1 if VBAT_ENABLE is not used on your board
+#define PIN_VBAT A0     
+#define BUTTON_PIN_1 1             // Button for display
+#define BUTTON_PIN_2 2             // Button for restart
+#define CONSENT_BUTTON 4            // Button for consent
+
+const byte RATE_SIZE = 4; // Number of readings for averaging
+byte rates[RATE_SIZE]; // Array of heart rates
+byte rateSpot = 0;
+long lastBeat = 0; // Time at which the last beat occurred
+float beatsPerMinute = 0;
+int beatAvg = 0;
+long lastIrValue = 0;
+bool isPeakDetected = false;
+long peakThreshold = 50000; // Threshold for detecting a heartbeat
+
+// Button Setup
+int buttonState1 = 0;
+int buttonState2 = 0;
+bool displayOn = false;
+unsigned long displayStartTime = 0;
+bool calibrationStarted = false;
+unsigned long buttonPressTime = 0;
+unsigned long restartPressTime = 0;
+int motorStartCount = 0;
+unsigned long elapsedTime = 0;
+
+// IR Calibration Values
+float maxIR = 0;
+float minIR = FLT_MAX;  // Use the largest possible float value
+const unsigned long phaseDuration = 30000;  // 30 seconds per phase in milliseconds
+unsigned long phaseStartTime = 0;
+
+// Global Min and Max IR values
+float globalMaxIR = FLT_MAX;
+float globalMinIR = 0;
+
+// Phases
+bool inExercisePhase = false;
+bool inRestPhase = false;
+
+// Motor Control Pin
+const int motorPin = 3;
+bool warningTriggered = false;
+bool falseAlarm = false;
+unsigned long warningStartTime = 0;
+unsigned long countdown = 0;
+
+// BLE Service and Characteristic UUIDs
+BLEService timeService("1805");       // Custom service UUID for time
+BLEStringCharacteristic timeCharacteristic("2A2B", BLERead | BLEWrite, 8);  // Custom characteristic UUID for time in HH:MM:SS format
+BLEService counterService("180F");    // Custom service UUID for counter and temperature
+BLEUnsignedLongCharacteristic counterChar("2A58", BLERead | BLENotify);  // Counter characteristic
+BLEByteCharacteristic confirmChar("2A59", BLEWrite);  // Confirmation characteristic
+BLEFloatCharacteristic tempChar("2A6E", BLERead | BLENotify);  // Temperature characteristic (in Celsius)
+BLEIntCharacteristic batteryPercentageChar("2A19", BLERead | BLENotify); // Battery percentage characteristic
+BLEFloatCharacteristic bpmChar("2A2A", BLERead | BLENotify); // BPM characteristic
+BLEFloatCharacteristic spo2Char("2A2C", BLERead | BLENotify); // SpO2 characteristic
+BLEByteCharacteristic emergencyChar("2A2D", BLERead | BLENotify); // Emergency characteristic
+BLEFloatCharacteristic maxIrChar("2A2E", BLERead | BLENotify); // Max IR characteristic
+BLEFloatCharacteristic minIrChar("2A2F", BLERead | BLENotify); // Min IR characteristic
+
+class Xiao {
+public:
+  Xiao();
+  float GetBatteryVoltage();
+  bool IsChargingBattery();
+  int GetBatteryPercentage(float voltage);  // Function to calculate battery percentage
+};
+
+Xiao::Xiao() {
+  if (BAT_HIGH_CHARGE != -1) pinMode(BAT_HIGH_CHARGE, OUTPUT);
+  if (BAT_CHARGE_STATE != -1) pinMode(BAT_CHARGE_STATE, INPUT);
+  if (BAT_HIGH_CHARGE != -1) digitalWrite(BAT_HIGH_CHARGE, HIGH);
+}
+
+float Xiao::GetBatteryVoltage() {
+  if (VBAT_ENABLE != -1) digitalWrite(VBAT_ENABLE, LOW);
+
+  uint32_t adcCount = analogRead(PIN_VBAT);
+  float adcVoltage = adcCount * (3.3 / 1023.0);
+  float vBat = adcVoltage * (1510.0 / 510.0);
+
+  if (VBAT_ENABLE != -1) digitalWrite(VBAT_ENABLE, HIGH);
+
+  return vBat;
+}
+
+bool Xiao::IsChargingBattery() {
+  if (BAT_HIGH_CHARGE != -1) {
+    return digitalRead(BAT_CHARGE_STATE) == LOW; // LOW indicates charging
+  }
+  return false;
+}
+
+int Xiao::GetBatteryPercentage(float voltage) {
+  if (voltage <= 3.0) return 0;
+  if (voltage >= 4.2) return 100;
+  return (int)((voltage - 3.0) * 100 / (4.2 - 3.0));
+}
+
+Xiao xiaoDevice;
+
+// Time variables
+bool bleConnected = false;
+unsigned long lastMillis = 0;
+int hours = 0, minutes = 0, seconds = 0;
+bool timeReceived = false;
+
+// Counter variables
+unsigned long counter = 0;
+unsigned long lastTime = 0;
+const unsigned long interval = 2000;  // Interval to update the counter (2 seconds)
+bool advertising = true;
+unsigned long lastConfirmTime = 0;
+const unsigned long consentDelay = 20000;
+bool consentReceived = false;
+unsigned long lastAdvertisingTime = 0;
+
+// Emergency variable
+byte emergencyValue = 0; // 0: normal, 1: emergency
+
+// New variable to track simultaneous button presses
+int simultaneousPressCount = 0;
+
+// Doses left variable
+int dosesLeft = 4; // Maximum doses
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Initializing...");
+
+  // Setup button and motor pins
+  pinMode(BUTTON_PIN_1, INPUT_PULLUP); // Initialize button pin for display
+  pinMode(BUTTON_PIN_2, INPUT_PULLUP); // Initialize button pin for restart
+  pinMode(motorPin, OUTPUT); // Initialize motor pin
+  digitalWrite(motorPin, LOW); // Ensure motor is off
+
+  // Initialize OLED display
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay();
+  display.display();
+
+  // Initialize MAX30105 sensor
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30105 was not found. Please check wiring/power.");
+    while (1);
+  }
+  Serial.println("Place your index finger on the sensor with steady pressure.");
+  particleSensor.setup();
+  particleSensor.setPulseAmplitudeRed(0x0A); // Turn Red LED to low to indicate sensor is running
+  particleSensor.setPulseAmplitudeGreen(0); // Turn off Green LED
+
+  // Initialize BLE
+  if (!BLE.begin()) {
+    Serial.println("Starting BLE failed!");
+    while (1);
+  }
+  BLE.setLocalName("TimeCounterReceiver");
+  BLE.setAdvertisedService(timeService);
+  BLE.setAdvertisedService(counterService);
+
+  timeService.addCharacteristic(timeCharacteristic);
+  counterService.addCharacteristic(counterChar);
+  counterService.addCharacteristic(confirmChar);
+  counterService.addCharacteristic(tempChar);
+  counterService.addCharacteristic(batteryPercentageChar); // Add battery percentage characteristic
+  counterService.addCharacteristic(bpmChar); // Add BPM characteristic
+  counterService.addCharacteristic(spo2Char); // Add SpO2 characteristic
+  counterService.addCharacteristic(emergencyChar); // Add emergency characteristic
+  counterService.addCharacteristic(maxIrChar); // Add max IR characteristic
+  counterService.addCharacteristic(minIrChar); // Add min IR characteristic
+  BLE.addService(timeService);
+  BLE.addService(counterService);
+
+  BLE.advertise();
+  Serial.println("Waiting for BLE connection to receive time...");
+
+  NRF_TEMP->TASKS_START = 1;  
+}
+
+void checkButtonPressesForMotorStart() {
+  static unsigned long lastPressTime = 0; // Track the last time buttons were pressed together
+
+  if (digitalRead(BUTTON_PIN_1) == LOW && digitalRead(BUTTON_PIN_2) == LOW) {
+    if (millis() - lastPressTime < 3000) {
+      // If both buttons are pressed and less than 3 seconds since the last press
+      simultaneousPressCount++;
+      Serial.print("Simultaneous presses: ");
+      Serial.println(simultaneousPressCount);
+
+      if (simultaneousPressCount == 2) {
+        Serial.println("Both buttons pressed twice. Starting motor...");
+        startMotor(); // Start the motor
+        simultaneousPressCount = 0; // Reset the count after starting the motor
+      }
+    } else {
+      // If more than 3 seconds have passed since the last press, reset the count
+      simultaneousPressCount = 1; // Count this press as the first one
+    }
+    lastPressTime = millis(); // Update the last press time
+  }
+}
+
+void loop() {
+  checkIRValue(); // Check the IR value continuously
+
+  long irValue = particleSensor.getIR();
+  long redValue = particleSensor.getRed(); // Get Red LED value
+
+  // Detect button presses
+  buttonState1 = digitalRead(BUTTON_PIN_1);
+  buttonState2 = digitalRead(BUTTON_PIN_2);
+
+  // Show IR and Red values on Serial Monitor
+  Serial.print("IR Value: ");
+  Serial.print(irValue);
+  Serial.print(" | Red Value: ");
+  Serial.println(redValue);
+
+  if (irValue > peakThreshold) { // Only calculate BPM if finger is on the sensor
+    detectBeat(irValue);
+  } else {
+    beatsPerMinute = 0; // Set BPM to 0 when no finger is detected
+    beatAvg = 0; // Reset average
+  }
+
+  // Calculate SpO2
+  float spo2 = calculateSpO2(redValue, irValue);
+
+  // Display data on Serial Monitor
+  Serial.print("BPM: ");
+  Serial.print(beatsPerMinute);
+  Serial.print(" | SpO2: ");
+  Serial.println(spo2);
+
+  // Button-controlled OLED display
+  if (buttonState1 == LOW && !displayOn) {
+    // Button pressed, turn on the display and show BPM, SpO2, and time
+    showOnOLED(beatsPerMinute, spo2);
+
+    // Record the time when the display was turned on
+    displayStartTime = millis();
+    displayOn = true;
+  }
+
+  // If the display is on and 3 seconds have passed, turn it off
+  if (displayOn && (millis() - displayStartTime >= 3000)) {
+    display.clearDisplay(); // Clear the display
+    display.display(); // Send the cleared buffer to the display
+    displayOn = false; // Set the flag to turn off the display
+  }
+
+  // Update the display with the current time if the display is on
+  if (displayOn) {
+    showOnOLED(beatsPerMinute, spo2); // Update the display with current values
+  }
+
+  // Check for warning condition: if IR value is out of range
+  if ((irValue < globalMinIR || irValue > globalMaxIR) && !falseAlarm) {
+    // Trigger warning message
+    if (!warningTriggered) {
+      Serial.println("Warning: Abnormal heart activity detected!");
+      warningStartTime = millis(); // Start the warning timer
+      warningTriggered = true; // Set flag to indicate warning is triggered
+      countdown = 15; // Set 15-second countdown
+    }
+    // Show warning message and countdown on OLED
+    showWarningWithCountdown(beatsPerMinute, spo2, countdown);
+    
+    // Send emergency value over BLE
+    emergencyValue = 1; // Indicate abnormal heartbeat
+    emergencyChar.writeValue(emergencyValue);
+  } else {
+    warningTriggered = false; 
+    emergencyValue = 0; // Indicate normal heartbeat
+    emergencyChar.writeValue(emergencyValue);
+  }
+
+  // Handle false alarm
+  if (warningTriggered && buttonState1 == LOW) {
+    Serial.println("False Alarm detected. Resuming normal operation...");
+    falseAlarm = true;  // Mark it as a false alarm
+    warningTriggered = false;  // Reset warning
+    display.clearDisplay();    // Clear warning message
+    display.display();
+    delay(3000);  // Wait 3 seconds before resuming normal operation
+    falseAlarm = false;  // Reset false alarm flag
+    emergencyValue = 0; // Indicate normal heartbeat
+    emergencyChar.writeValue(emergencyValue);
+    return;
+  }
+
+  // After 15 seconds of showing the warning message, start the motor
+  if (warningTriggered && (millis() - warningStartTime >= 1000)) {
+    countdown--;
+    warningStartTime = millis(); // Reset warning start time for countdown
+
+    if (countdown == 0) {
+        if (motorStartCount < 2) { // Check if the motor has been started less than 2 times
+            Serial.println("Starting motor...");
+            startMotor();
+            motorStartCount++; // Increment the counter after starting the motor
+        } else {
+            Serial.println("Motor has already been started twice. No further action.");
+        }
+        warningTriggered = false; // Reset warning after motor starts
+    }
+  }
+
+  // Check if both buttons are pressed together
+  checkButtonPressesForMotorStart();
+
+  // BLE functionality
+  BLEDevice central = BLE.central();
+  if (central && !bleConnected) {
+    bleConnected = true;
+    Serial.println("BLE device connected. Waiting for time...");
+
+    while (central.connected()) {
+      if (timeCharacteristic.written()) {
+        String receivedTime = timeCharacteristic.value();
+        Serial.print("Received time: ");
+        Serial.println(receivedTime);
+
+        if (sscanf(receivedTime.c_str(), "%2d:%2d:%2d", &hours, &minutes, &seconds) == 3) {
+          Serial.println("Time set successfully.");
+          timeReceived = true;
+          break;
+        } else {
+          Serial.println("Invalid time format. Expected HH:MM:SS.");
+        }
+      }
+
+      // Receive max and min IR values if calibration is not done
+      if (!calibrationStarted) {
+        if (maxIrChar.written()) {
+          globalMaxIR = maxIrChar.value();
+          Serial.print("Received Max IR: ");
+          Serial.println(globalMaxIR);
+        }
+        if (minIrChar.written()) {
+          globalMinIR = minIrChar.value();
+          Serial.print("Received Min IR: ");
+          Serial.println(globalMinIR);
+        }
+      }
+    }
+    Serial.print("Disconnected from central: ");
+    Serial.println(central.address());
+    bleConnected = false;
+  }
+
+  if (advertising) {
+    if (central) {
+      Serial.print("Connected to central: ");
+      Serial.println(central.address());
+
+      while (central.connected()) {
+        unsigned long currentTime = millis();
+        
+        if (emergencyValue == 1) {
+          // Continuously send data when in emergency mode
+          if (currentTime - lastTime >= 1000) { // Send every second in emergency mode
+            lastTime = currentTime;
+            sendData();
+          }
+        } else {
+          // Send data every 20 seconds when not in emergency mode
+          if (currentTime - lastTime >= 20000) {
+            lastTime = currentTime;
+            sendData();
+          }
+        }
+
+        if (confirmChar.written()) {
+          byte confirmation = confirmChar.value();
+          Serial.print("Confirmation received: ");
+          Serial.println(confirmation);
+          
+          if (confirmation == 1) {
+            Serial.println("Confirmation received, turning off BLE to save power...");
+            consentReceived = true;
+            stopBLE();
+            break;
+          }
+        }
+      }
+      Serial.print("Disconnected from central: ");
+      Serial.println(central.address());
+    }
+  } else {
+    if(millis() - lastConfirmTime >= consentDelay) {
+      consentReceived = false;
+      startBLE();
+      advertising = true;
+      lastAdvertisingTime = millis();
+    }
+  }
+
+  if (timeReceived && millis() - lastMillis >= 1000) {
+    lastMillis += 1000;
+    incrementTime();
+
+    Serial.print("Local time: ");
+    if (hours < 10) Serial.print("0");
+    Serial.print(hours);
+    Serial.print(":");
+    if (minutes < 10) Serial.print("0");
+    Serial.print(minutes);
+    Serial.print(":");
+    if (seconds < 10) Serial.print("0");
+    Serial.println(seconds);
+  }
+
+  // Calibration and motor control logic
+  if (buttonState1 == LOW) {
+    if (buttonPressTime == 0) {
+      buttonPressTime = millis();
+    }
+
+    if (millis() - buttonPressTime > 5000 && !calibrationStarted) {
+      startCalibration();
+      calibrationStarted = true;
+    }
+  } else {
+    buttonPressTime = 0;  // Reset button press time when button is released
+  }
+
+  // Restart logic
+  if (buttonState2 == LOW) {
+    if (restartPressTime == 0) {
+      restartPressTime = millis();
+    }
+
+    if (millis() - restartPressTime > 3000) {
+      Serial.println("Restarting device...");
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.setTextSize(2);
+      display.println("Rebooting");
+      display.display();
+      delay(3000);
+      NVIC_SystemReset(); // Reset the microcontroller
+    }
+  } else {
+    restartPressTime = 0;  // Reset restart press time when button is released
+  }
+
+  if (calibrationStarted) {
+    runCalibration();
+  }
+
+  delay(100); // Small delay for stability
+}
+
+// Function to check the IR value and reinitialize if it equals 0
+void checkIRValue() {
+  long irValue = particleSensor.getIR();
+  if (irValue == 0) {
+    Serial.println("IR value is 0, reinitializing sensor and display...");
+    initializeSensor();
+  }
+}
+
+// Function to initialize the sensor and OLED display
+void initializeSensor() {
+  // Reinitialize the OLED display
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay();
+  display.display();
+
+  // Reinitialize the MAX30105 sensor
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30105 was not found. Please check wiring/power.");
+    while (1);
+  }
+  Serial.println("Place your index finger on the sensor with steady pressure.");
+  particleSensor.setup();
+  particleSensor.setPulseAmplitudeRed(0x0A); // Turn Red LED to low to indicate sensor is running
+  particleSensor.setPulseAmplitudeGreen(0); // Turn off Green LED
+}
+
+// Function to start the motor and decrease doses left
+void startMotor() {
+  if (dosesLeft > 0) {
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.print("Medication!");
+    display.setTextSize(1);
+    display.print("Open your mouth");
+    display.print("\nDoses left: ");
+    display.println(dosesLeft);
+    display.display();
+    delay(8000);
+    Serial.println("Starting motor...");
+    digitalWrite(motorPin, HIGH); // Start the motor
+    delay(3000);
+    digitalWrite(motorPin, LOW);
+    dosesLeft--; // Decrease the doses left
+  } else {
+    Serial.println("No doses left to dispense.");
+  }
+}
+
+// Function to update OLED display based on button press
+void showOnOLED(float bpm, float spo2) {
+  display.clearDisplay(); // Clear the display buffer
+  
+  display.setTextColor(SSD1306_WHITE); // Set text color to white
+  display.setCursor(0, 0); // Set the cursor position
+
+  // Display the local time
+  display.setTextSize(2); // Smaller text for time
+  if (hours < 10) display.print("0");
+  display.print(hours);
+  display.print(":");
+  if (minutes < 10) display.print("0");
+  display.print(minutes);
+  display.print(":");
+  if (seconds < 10) display.print("0");
+  display.println(seconds);
+  display.setTextSize(2); // Set text size (1 for small, 2 for larger text)
+  display.print("BPM:");
+  display.println(bpm);
+  display.print("SPO2:");
+  display.println(int(spo2));
+  // Display doses left
+  display.setTextSize(1);
+  display.print("Doses:");
+  display.println(dosesLeft);
+
+  display.display(); // Send the buffer to the display
+}
+
+// Function to display a warning message with countdown on the OLED
+void showWarningWithCountdown(float bpm, float spo2, unsigned long countdown) {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+
+  // Print the warning message, BPM, SpO2, and countdown
+  display.println("WARNING!");
+  display.setTextSize(1);
+  display.print("BPM:");
+  display.println(bpm);
+  display.print("SPO2:");
+  display.println(spo2);
+  display.setTextSize(2);
+  display.print("Countdown:");
+  display.println(countdown);
+
+  display.display(); // Update the display
+}
+
+// Function to detect a heartbeat by tracking IR peaks
+void detectBeat(long irValue) {
+  if (irValue > lastIrValue && !isPeakDetected && irValue > peakThreshold) {
+    isPeakDetected = true;
+    long currentTime = millis();
+    long delta = currentTime - lastBeat;
+    lastBeat = currentTime;
+
+    float bpm = 60.0 / (delta / 1000.0); // Convert time difference to BPM
+    if (bpm < 255 && bpm > 20) {
+      rates[rateSpot++] = (byte)bpm;
+      rateSpot %= RATE_SIZE;
+
+      beatAvg = 0;
+      for (byte x = 0; x < RATE_SIZE; x++) {
+        beatAvg += rates[x];
+      }
+      beatAvg /= RATE_SIZE;
+
+      beatsPerMinute = beatAvg;
+    }
+  }
+
+  if (irValue < lastIrValue) {
+    isPeakDetected = false;
+  }
+
+  lastIrValue = irValue; // Update the last IR value
+}
+
+// Function to calculate SpO2 based on the red and infrared values
+float calculateSpO2(long red, long ir) {
+  float r = (float)red / (float)ir;
+  float spo2 = 110.0 - (25.0 * r);
+  if (spo2 < 0) spo2 = 0;
+  if (spo2 > 100) spo2 = 100;
+  return spo2;
+}
+
+void startCalibration() {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.println("Starting Calibration");
+  display.display();
+  delay(2000);  // Wait for 2 seconds
+
+  // Start the exercise phase
+  startExercisePhase();
+}
+
+void startExercisePhase() {
+  inExercisePhase = true;
+  inRestPhase = false;
+  phaseStartTime = millis();
+  maxIR = 0;  // Reset max IR value
+
+  // Show the "Start Exercise" message
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("Start Exercise");
+  display.display();
+}
+
+void startRestPhase() {
+  inExercisePhase = false;
+  inRestPhase = true;
+  phaseStartTime = millis();
+  minIR = FLT_MAX;  // Reset min IR value to the highest possible
+
+  // Show the "Start Resting" message
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("Start Resting");
+  display.display();
+}
+
+void runCalibration() {
+  unsigned long currentTime = millis();
+
+  // Exercise phase
+  if (inExercisePhase) {
+    elapsedTime = (currentTime - phaseStartTime) / 1000;  // Elapsed time in seconds
+
+    // Display elapsed time during the exercise phase
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.setTextSize(2);
+    display.println("Exercise Phase");
+    display.print("Elapsed Time: ");
+    display.print(elapsedTime);
+    display.println(" s");
+    display.display();
+
+    // Read IR sensor value
+    float currentIR = particleSensor.getIR();
+
+    // Update max IR value during the exercise phase
+    if (currentIR > maxIR) {
+      maxIR = currentIR;
+    }
+
+    // After 30 seconds, switch to the rest phase
+    if (currentTime - phaseStartTime >= phaseDuration) {
+      delay(5000);
+      startRestPhase();  // Transition to the rest phase
+      return;  // Exit the current iteration to avoid overlapping logic
+    }
+  }
+
+  // Rest phase
+  if (inRestPhase) {
+    elapsedTime = (currentTime - phaseStartTime) / 1000;  // Elapsed time in seconds
+
+    // Display elapsed time during the rest phase
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.setTextSize(2);
+    display.println("Rest Phase");
+    display.print("Elapsed Time: ");
+    display.print(elapsedTime);
+    display.println(" s");
+    display.display();
+
+    // Read IR sensor value
+    float currentIR = particleSensor.getIR();
+
+    // Update min IR value during the rest phase
+    if (currentIR < minIR && currentIR > 0) {  // Ensure valid IR value
+      minIR = currentIR;
+    }
+
+    // After 30 seconds of rest, finish calibration
+    if (currentTime - phaseStartTime >= phaseDuration) {
+      finishCalibration();  // Finalize the calibration process
+    }
+  }
+}
+
+void finishCalibration() {
+  inRestPhase = false;
+  calibrationStarted = false;
+
+  // Update global max and min IR values
+  globalMaxIR = maxIR;
+  globalMinIR = minIR;
+
+  // Show "Calibration Done" message
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.println("Calibration Done");
+  display.setTextSize(1);
+  display.print("Max IR:");
+  display.println(globalMaxIR);
+  display.print("Min IR:");
+  display.println(globalMinIR);
+  display.display();
+
+  // Send max and min IR values over BLE
+  maxIrChar.writeValue(globalMaxIR);
+  minIrChar.writeValue(globalMinIR);
+
+  delay(10000);  // Show the message for 10 seconds
+}
+
+int32_t readTemperature() {
+  NRF_TEMP->TASKS_START = 1;
+  
+  while (NRF_TEMP->EVENTS_DATARDY == 0);
+  NRF_TEMP->EVENTS_DATARDY = 0;
+  
+  int32_t tempRaw = NRF_TEMP->TEMP;
+  NRF_TEMP->TASKS_STOP = 1;
+  
+  return tempRaw * 25;
+}
+
+void stopBLE() {
+  BLE.stopAdvertise();
+  advertising = false;
+  lastConfirmTime = millis();
+  Serial.println("BLE stopped for power saving...");
+}
+
+void startBLE() {
+  BLE.advertise();
+  Serial.println("BLE device is now advertising...");
+}
+
+void incrementTime() {
+  seconds++;
+  if (seconds >= 60) {
+    seconds =  0;
+    minutes++;
+    if (minutes >= 60) {
+      minutes = 0;
+      hours++;
+      if (hours >= 24) {
+        hours = 0;
+      }
+    }
+  }
+}
+
+void sendData() {
+  float tempC = readTemperature() / 100.0;
+  tempChar.writeValue(tempC);
+  Serial.print("Temperature (Celsius): ");
+  Serial.println(tempC);
+
+  float batteryVoltage = xiaoDevice.GetBatteryVoltage();
+  int batteryPercentage = xiaoDevice.GetBatteryPercentage(batteryVoltage);
+  batteryPercentageChar.writeValue(batteryPercentage); // Update battery percentage
+  Serial.print("Battery Percentage: ");
+  Serial.println(batteryPercentage);
+
+  // Send BPM and SpO2 over BLE
+  bpmChar.writeValue(beatsPerMinute);
+  spo2Char.writeValue(calculateSpO2(particleSensor.getRed(), particleSensor.getIR()));
+  Serial.print("BPM sent: ");
+  Serial.println(beatsPerMinute);
+  Serial.print("SpO2 sent: ");
+  Serial.println(calculateSpO2(particleSensor.getRed(), particleSensor.getIR()));
+}
